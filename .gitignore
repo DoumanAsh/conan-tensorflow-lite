@@ -1,0 +1,12 @@
+*~
+source_subfolder/
+_bazel
+triSYCL-master/
+bazel-real
+bazel-complete.sh
+package/
+*.cmake
+conan*.txt
+*.json
+bazel-*.exe
+bazel-*.sh
