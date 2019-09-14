@@ -1,8 +1,26 @@
 from conans import ConanFile, tools
 from conans.errors import ConanException
 from io import StringIO
-import os, sys, platform, re, shutil
+import os, sys, re, shutil, subprocess, itertools
 
+EGL_CONTEXT_PATCH = """
+--- source_subfolder/tensorflow/lite/delegates/gpu/gl/egl_context_old.cc	2019-08-23 08:29:48.000000000 +0000
++++ source_subfolder/tensorflow/lite/delegates/gpu/gl/egl_context.cc	2019-08-23 08:30:44.000000000 +0000
+@@ -15,6 +15,8 @@
+ #include "tensorflow/lite/delegates/gpu/gl/egl_context.h"
++#include <cstring>
++
+ #include "tensorflow/lite/delegates/gpu/common/status.h"
+ #include "tensorflow/lite/delegates/gpu/gl/gl_call.h"
+ #include "tensorflow/lite/delegates/gpu/gl/gl_errors.h"
+@@ -54,7 +56,7 @@
+ }
+ bool HasExtension(EGLDisplay display, const char* name) {
+-  return strstr(eglQueryString(display, EGL_EXTENSIONS), name);
++  return std::strstr(eglQueryString(display, EGL_EXTENSIONS), name);
+ }
+ }  // namespace
+"""
 
 class TensorFlowLiteConan(ConanFile):
     name = "tensorflow-lite"
@@ -69,7 +87,6 @@ class TensorFlowLiteConan(ConanFile):
         """
         if self.ndk_path is None:
             return
-
         stdout = StringIO()
         try:
             self.run("bazel info", output=stdout)
@@ -91,7 +108,6 @@ class TensorFlowLiteConan(ConanFile):
             self.run("pip3 install --upgrade autopep8")
             self.run("autopep8 --in-place {}".format(android_bzl))
 
-
     def build(self):
         if self.settings.arch in ("armv7", "armv8"):
             self.ndk_path = self.env_info.vars.get("ANDROID_NDK")
@@ -101,10 +117,10 @@ class TensorFlowLiteConan(ConanFile):
         # tensorflow fixed on master https://github.com/tensorflow/tensorflow/commit/b77b28d9db08a5f29988e7ca5e628df2b168d433#diff-53f8512109b5194fdae1e37b9018d0fa
         # Remove on next release
         try:
-            self.run("patch -s -f {}/tensorflow/lite/delegates/gpu/gl/egl_context.cc < egl_context.patch".format(self.source_subfolder))
-        except:
+            subprocess.run(["patch", "-s", "-f", "{}/tensorflow/lite/delegates/gpu/gl/egl_context.cc".format(self.source_subfolder)], input=EGL_CONTEXT_PATCH, encoding='utf-8', check=True)
+        except subprocess.CalledProcessError as error:
+            self.output.warn("Failed to apply patch: {}".format(error))
             # Already applied
-            pass
 
         with tools.chdir(self.source_subfolder):
             env_build = dict()
@@ -130,6 +146,17 @@ class TensorFlowLiteConan(ConanFile):
             else:
                 extra_flags = ''
 
+            if self.settings.compiler.libcxx == 'libstdc++':
+                extra_flags += " --copt='-D_GLIBCXX_USE_CXX11_ABI=0'"
+                if self.settings.compiler == "clang":
+                    extra_flags += " --copt='-stdlib=libstdc++'"
+            elif self.settings.compiler.libcxx == 'libstdc++11':
+                extra_flags += " --copt='-D_GLIBCXX_USE_CXX11_ABI=1'"
+                if self.settings.compiler == "clang":
+                    extra_flags += " --copt='-stdlib=libstdc++'"
+            elif self.settings.compiler.libcxx == 'libc++' and self.settings.compiler == "clang":
+                extra_flags += " --copt='-stdlib=libc++'"
+
             if self.ndk_path is not None:
                 self.output.info("Using NDK: {}".format(self.ndk_path))
                 env_build["ANDROID_NDK_HOME"] = self.ndk_path
@@ -147,29 +174,40 @@ class TensorFlowLiteConan(ConanFile):
                 #Both are external dependencies
                 env_build["TF_NEED_COMPUTECPP"] = '0'
                 env_build["TRISYCL_INCLUDE_DIR"] = "{}/include".format(sycl_path)
+
                 if self.settings.compiler == "clang":
                     env_build["HOST_CXX_COMPILER"] = "{}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++".format(self.ndk_path)
                     env_build["HOST_C_COMPILER"] = "{}/toolchains/llvm/prebuilt/linux-x86_64/bin/clang".format(self.ndk_path)
+                elif self.settings.arch == 'armv7':
+                    env_build["HOST_C_COMPILER"] = "{}/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/lib/gcc".format(self.ndk_path)
+                    env_build["HOST_CXX_COMPILER"] = "{}/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/lib/gcc".format(self.ndk_path)
                 else:
-                    env_build["HOST_CXX_COMPILER"] = "{}/toolchains/llvm/prebuilt/linux-x86_64/bin/g++".format(self.ndk_path)
-                    env_build["HOST_C_COMPILER"] = "{}/toolchains/llvm/prebuilt/linux-x86_64/bin/gcc".format(self.ndk_path)
+                    env_build["HOST_C_COMPILER"] = "{}/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64/lib/gcc".format(self.ndk_path)
+                    env_build["HOST_CXX_COMPILER"] = "{}/toolchains/aarch64-linux-android-4.9/prebuilt/linux-x86_64/lib/gcc".format(self.ndk_path)
 
                 # NDK compiler doesn't support -march=native?
                 env_build["CC_OPT_FLAGS"] = '-Wno-sign-compare'
 
             else:
                 # Necessary work-around to compile GPU delegate
-                if self.options.gpu:
-                    extra_flags = extra_flags + " --cxxopt='-DMESA_EGL_NO_X11_HEADERS' "
+                if is_msvc:
+                    extra_flags = extra_flags + " --copt='/DMESA_EGL_NO_X11_HEADERS' "
+                else:
+                    extra_flags = extra_flags + " --copt='-DMESA_EGL_NO_X11_HEADERS' "
 
                 if self.settings.compiler == "clang":
                     env_build["HOST_CXX_COMPILER"] = "clang++"
                     env_build["HOST_C_COMPILER"] = "clang"
+                elif self.settings.compiler == "Visual Studio":
+                    env_build["HOST_CXX_COMPILER"] = "cl"
+                    env_build["HOST_C_COMPILER"] = "cl"
                 else:
                     env_build["HOST_CXX_COMPILER"] = "g++"
                     env_build["HOST_C_COMPILER"] = "gcc"
 
-                env_build["CC_OPT_FLAGS"] = "/arch:AVX" if self.settings.compiler == "Visual Studio" else "-Wno-sign-compare -march=native"
+                #-march=native requires working AVX512 (which had lots of bugs in TF), and not available everywhere
+                #we choose more conservative sse4.2 and avx2 only, fma is AMD set and should be available for current HW, also available in Intel's chips
+                env_build["CC_OPT_FLAGS"] = "/arch:AVX" if is_msvc else "-Wno-sign-compare -msse4.2 -mavx2 -mfma"
 
             with tools.environment_append(env_build):
                 self.run("python configure.py")
@@ -189,11 +227,22 @@ class TensorFlowLiteConan(ConanFile):
                     "//tensorflow/lite:libtensorflowlite.so",
                 ]
 
+                if is_msvc:
+                    # In recent versions of msvc C++11 is default
+                    std_flag = ""
+                else:
+                    std_flag = "--cxxopt=--std=c++11"
+
+                if is_debug:
+                    opt_flag = "-c dbg --copt=-O1" #Default is fastbuild which strips some debug info
+                else:
+                    opt_flag = "-c opt --config=opt"
+
                 if self.options.gpu:
                     targets.append("//tensorflow/lite/delegates/gpu:libtensorflowlite_gpu_gl.so")
 
-                build_opts = "--config=opt --config=v2 --cxxopt='--std=c++11' --define=no_tensorflow_py_deps=true {}".format(extra_flags)
-                cmd = "bazel build {} {} --verbose_failures".format(build_opts, " ".join(targets))
+                build_opts = "{} --config=v2 {} --define=no_tensorflow_py_deps=true {}".format(opt_flag, std_flag, extra_flags)
+                cmd = "bazel build -s {} {} --verbose_failures".format(build_opts, " ".join(targets))
                 self.output.info(">>>{}".format(cmd))
                 self.run(cmd)
 
@@ -206,12 +255,20 @@ class TensorFlowLiteConan(ConanFile):
         shutil.rmtree("{}/libtensorflowlite.so.runfiles".format(lib_dir), True)
         shutil.rmtree("{}/delegates/gpu/libtensorflowlite_gpu_gl.so.runfiles".format(lib_dir), True)
 
-        self.copy("*.so", dst="lib", src=lib_dir, keep_path=False, symlinks=None)
-        self.copy("*.dll", dst="lib", src=lib_dir, keep_path=False, symlinks=None)
-        self.copy("*.dylib*", dst="lib", src=lib_dir, keep_path=False, symlinks=None)
+        libs = itertools.chain(
+                self.copy("*.so", dst="lib", src=lib_dir, keep_path=False, symlinks=None),
+                self.copy("*.dll", dst="lib", src=lib_dir, keep_path=False, symlinks=None),
+                self.copy("*.dylib*", dst="lib", src=lib_dir, keep_path=False, symlinks=None))
 
-        self.copy("*.h", dst="inc", src=inc_dir, keep_path=True, symlinks=True)
-        self.copy("*.hpp", dst="inc", src=inc_dir, keep_path=True, symlinks=True)
+        # Conan bug?
+        # bazel produces libraries with r-x perms, and conan uses shutil.copy2 to perform all copies
+        # As result it preserves metadata, but internally it opens file for write, which results in error on second time you copy files
+        # So just make it 777
+        for lib in libs:
+            os.chmod(lib, 0o777)
+
+        self.copy("*.h", dst="include/tensorflow/lite", src=inc_dir, keep_path=True, symlinks=True)
+        self.copy("*.hpp", dst="include/tensorflow/lite", src=inc_dir, keep_path=True, symlinks=True)
 
     def package_info(self):
         self.cpp_info.libs = ["tensorflowlite"]
